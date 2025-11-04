@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"time"
 
 	"golang.org/x/time/rate"
 )
@@ -24,6 +26,13 @@ const (
 	rateLimit                       = 4
 )
 
+var (
+	// backoff settings for retrying 503 responses
+	backoffMaxRetries = 3
+	backoffBaseDelay  = 100 * time.Millisecond
+	backoffMaxJitter  = 100 * time.Millisecond
+)
+
 // Client client for airtable api.
 type Client struct {
 	client                  *http.Client
@@ -31,6 +40,10 @@ type Client struct {
 	baseURL                 string
 	uploadAttachmentBaseURL string
 	apiKey                  string
+	// backoff parameters (per-client)
+	maxRetries    int
+	backoffBase   time.Duration
+	backoffJitter time.Duration
 }
 
 // NewClient airtable client constructor
@@ -43,7 +56,25 @@ func NewClient(apiKey string) *Client {
 		apiKey:                  apiKey,
 		baseURL:                 airtableBaseURL,
 		uploadAttachmentBaseURL: airtableUploadAttachmentBaseURL,
+		maxRetries:              backoffMaxRetries,
+		backoffBase:             backoffBaseDelay,
+		backoffJitter:           backoffMaxJitter,
 	}
+}
+
+// SetBackoffRetries sets how many retries will be attempted on 503 responses.
+func (at *Client) SetBackoffRetries(n int) {
+	at.maxRetries = n
+}
+
+// SetBackoffBaseDelay sets the base delay used for exponential backoff.
+func (at *Client) SetBackoffBaseDelay(d time.Duration) {
+	at.backoffBase = d
+}
+
+// SetBackoffMaxJitter sets the maximum jitter added to backoff sleeps.
+func (at *Client) SetBackoffMaxJitter(d time.Duration) {
+	at.backoffJitter = d
 }
 
 // Set custom http client for custom usage
@@ -244,26 +275,81 @@ func (at *Client) do(req *http.Request, response any) error {
 
 	url := req.URL.RequestURI()
 
-	resp, err := at.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP request failure on %s: %w", url, err)
+	// Ensure request body can be replayed for retries. If GetBody is not
+	// provided, read the body and set GetBody so we can recreate Body for
+	// each attempt.
+	if req.Body != nil && req.GetBody == nil {
+		bodyBytes, err := io.ReadAll(req.Body)
+		if err != nil {
+			return fmt.Errorf("reading request body before retrying: %w", err)
+		}
+		// reset original Body
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
 	}
 
-	defer resp.Body.Close()
+	// Attempt requests with retries on 503. On non-503 non-2xx responses we
+	// return immediately. On 503 we retry with exponential backoff + jitter.
+	for attempt := 0; attempt <= backoffMaxRetries; attempt++ {
+		creq := req.Clone(req.Context())
+		if req.GetBody != nil {
+			rc, err := req.GetBody()
+			if err != nil {
+				return fmt.Errorf("failed to get request body for retry: %w", err)
+			}
+			creq.Body = rc
+		}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return makeHTTPClientError(url, resp)
+		resp, err := at.client.Do(creq)
+		if err != nil {
+			return fmt.Errorf("HTTP request failure on %s: %w", url, err)
+		}
+
+		// If it's a 503 and we still have retries left, drain and close the
+		// body then sleep and retry. If this is the final attempt, let
+		// makeHTTPClientError read the body (don't close it here).
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			if attempt == backoffMaxRetries {
+				// final attempt, return error; do not close body so the
+				// error helper can read it.
+				return makeHTTPClientError(url, resp)
+			}
+
+			// drain and close so idle connection can be reused
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			// exponential backoff with jitter
+			sleep := backoffBaseDelay * time.Duration(1<<attempt)
+			jitter := time.Duration(rand.Int63n(int64(backoffMaxJitter)))
+			time.Sleep(sleep + jitter)
+
+			// try again
+			continue
+		}
+
+		// Non-2xx responses (other than 503 handled above)
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return makeHTTPClientError(url, resp)
+		}
+
+		// Success path: read the body, close, and unmarshal
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("HTTP Read error on response for %s: %w", url, err)
+		}
+
+		err = json.Unmarshal(b, response)
+		if err != nil {
+			return fmt.Errorf("JSON decode failed on %s:\n%s\nerror: %w", url, string(b), err)
+		}
+
+		return nil
 	}
 
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("HTTP Read error on response for %s: %w", url, err)
-	}
-
-	err = json.Unmarshal(b, response)
-	if err != nil {
-		return fmt.Errorf("JSON decode failed on %s:\n%s\nerror: %w", url, string(b), err)
-	}
-
-	return nil
+	// Should never reach here
+	return errors.New("request retry loop exhausted")
 }
