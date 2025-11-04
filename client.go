@@ -15,6 +15,8 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -31,6 +33,7 @@ var (
 	backoffMaxRetries = 3
 	backoffBaseDelay  = 100 * time.Millisecond
 	backoffMaxJitter  = 100 * time.Millisecond
+	backoffMaxDelay   = 2 * time.Second
 )
 
 // Client client for airtable api.
@@ -41,9 +44,10 @@ type Client struct {
 	uploadAttachmentBaseURL string
 	apiKey                  string
 	// backoff parameters (per-client)
-	maxRetries    int
-	backoffBase   time.Duration
-	backoffJitter time.Duration
+	maxRetries      int
+	backoffBase     time.Duration
+	backoffJitter   time.Duration
+	backoffMaxDelay time.Duration
 }
 
 // NewClient airtable client constructor
@@ -59,6 +63,7 @@ func NewClient(apiKey string) *Client {
 		maxRetries:              backoffMaxRetries,
 		backoffBase:             backoffBaseDelay,
 		backoffJitter:           backoffMaxJitter,
+		backoffMaxDelay:         backoffMaxDelay,
 	}
 }
 
@@ -75,6 +80,12 @@ func (at *Client) SetBackoffBaseDelay(d time.Duration) {
 // SetBackoffMaxJitter sets the maximum jitter added to backoff sleeps.
 func (at *Client) SetBackoffMaxJitter(d time.Duration) {
 	at.backoffJitter = d
+}
+
+// SetBackoffMaxDelay sets the maximum delay (cap) for exponential backoff.
+// If set to 0, backoff delay will be uncapped
+func (at *Client) SetBackoffMaxDelay(d time.Duration) {
+	at.backoffMaxDelay = d
 }
 
 // Set custom http client for custom usage
@@ -290,9 +301,10 @@ func (at *Client) do(req *http.Request, response any) error {
 		}
 	}
 
-	// Attempt requests with retries on 503. On non-503 non-2xx responses we
-	// return immediately. On 503 we retry with exponential backoff + jitter.
-	for attempt := 0; attempt <= backoffMaxRetries; attempt++ {
+	// Attempt requests with retries on 503 and 429. On non-retryable
+	// non-2xx responses we return immediately. On retryable responses we
+	// retry with exponential backoff + jitter, capped by backoffMaxDelay.
+	for attempt := 0; attempt <= at.maxRetries; attempt++ {
 		creq := req.Clone(req.Context())
 		if req.GetBody != nil {
 			rc, err := req.GetBody()
@@ -306,24 +318,48 @@ func (at *Client) do(req *http.Request, response any) error {
 		if err != nil {
 			return fmt.Errorf("HTTP request failure on %s: %w", url, err)
 		}
-
-		// If it's a 503 and we still have retries left, drain and close the
-		// body then sleep and retry. If this is the final attempt, let
-		// makeHTTPClientError read the body (don't close it here).
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			if attempt == backoffMaxRetries {
+		// If it's a retryable status (503 or 429), handle retries.
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+			if attempt == at.maxRetries {
 				// final attempt, return error; do not close body so the
 				// error helper can read it.
 				return makeHTTPClientError(url, resp)
+			}
+
+			// Determine sleep duration: prefer Retry-After header if present.
+			var sleep time.Duration
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				// try parse as integer seconds
+				if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil {
+					sleep = time.Duration(secs) * time.Second
+				} else if t, err := http.ParseTime(ra); err == nil {
+					sleep = time.Until(t)
+					if sleep < 0 {
+						sleep = 0
+					}
+				}
+			}
+
+			// If no Retry-After, use exponential backoff
+			if sleep == 0 {
+				sleep = at.backoffBase * time.Duration(1<<attempt)
+			}
+
+			// clip to max delay
+			if at.backoffMaxDelay > 0 && sleep > at.backoffMaxDelay {
+				sleep = at.backoffMaxDelay
 			}
 
 			// drain and close so idle connection can be reused
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 
-			// exponential backoff with jitter
-			sleep := backoffBaseDelay * time.Duration(1<<attempt)
-			jitter := time.Duration(rand.Int63n(int64(backoffMaxJitter)))
+			// add jitter
+			var jitter time.Duration
+			if at.backoffJitter > 0 {
+				jitter = time.Duration(rand.Int63n(int64(at.backoffJitter)))
+			}
+
 			time.Sleep(sleep + jitter)
 
 			// try again

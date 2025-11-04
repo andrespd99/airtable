@@ -93,6 +93,37 @@ func TestClient_do_retriesOn503_exhaust(t *testing.T) {
 	}
 }
 
+func TestClient_do_retriesOn429_success(t *testing.T) {
+	c := testClient()
+	// server returns 429 twice, then 200 with JSON
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls < 2 {
+			calls++
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	req, err := http.NewRequest("GET", srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out map[string]any
+	if err := c.do(req, &out); err != nil {
+		t.Fatalf("expected success after retries on 429, got err: %v", err)
+	}
+
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("expected ok=true in response, got: %#v", out)
+	}
+}
+
 func TestClient_SetBaseURL(t *testing.T) {
 	testCases := []struct {
 		description   string
